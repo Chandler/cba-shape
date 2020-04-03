@@ -21,21 +21,6 @@ class PlaneCurve(object):
         # The vectorized derivative of y
         self.dy = vmap(grad(self._y))
 
-    def f(self, t):
-        """ The immersion of the curve into the plane
-
-        Vectorized function
-
-        Parameters
-        ----------
-        t: nd.array, N, float32
-
-        Returns
-        -------
-        nd.array, N x 2
-        """
-        return np.array([self.u(t), self.v(t)]).swapaxes(0, 1)
-
     @abstractmethod
     def t_range(self) -> List[float]:
         """ The domain of t, expressed as a floating point
@@ -58,6 +43,21 @@ class PlaneCurve(object):
         """ The coordinate function y
         """
         pass
+
+    def f(self, t):
+        """ The immersion of the curve into the plane
+
+        Vectorized function
+
+        Parameters
+        ----------
+        t: nd.array, N, float32
+
+        Returns
+        -------
+        nd.array, N x 2
+        """
+        return np.array([self.u(t), self.v(t)]).swapaxes(0, 1)
 
 
 class SpaceCurve(object):
