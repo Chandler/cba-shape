@@ -5,6 +5,8 @@ import numpy as np
 from jax import np as jnp
 from geometry.smooth.curves import PlaneCurve
 from linear_algebra.la_util import normalize_vectors
+import quadpy
+import scipy
 
 
 class Surface(object):
@@ -28,8 +30,8 @@ class Surface(object):
         self.hessianXYZ = vmap(hessian(self._f))  # (N x 2) -> 3 x N x 2 x 2
 
         # The first derivative of f
-        # (This is equal to self.jacobian_matrix except in shape)
-        self.df = vmap(jacfwd(self._f))
+        # This is equal to self.jacobian_matrix
+        self.df = lambda uv: np.array(vmap(jacfwd(self._f))(uv)).swapaxes(0, 1)
 
         dX = grad(self._X)  # (N x 2) -> N x 2
         dY = grad(self._Y)  # (N x 2) -> N x 2
@@ -46,7 +48,7 @@ class Surface(object):
 
         # The vectorized differential of the Guass map
         # This is called the Weingarten map
-        self.dN = vmap(grad(_N))
+        self.dN = vmap(jacfwd(_N))
 
     # ======================================================
     # All abstract methods required to implement this surface
@@ -173,12 +175,51 @@ class Surface(object):
         by sampling it on the surface then summing and scaling
         the result
         """
-        values = W(self.coordinates(step))
-        return np.nansum(values * self.u_scale(step) * self.v_scale(step))
+        # alternate: np.nansum(W(self.coordinates(step)) * self.u_scale(step) * self.v_scale(step))
 
-    # ========================================================
-    # Constructions from the partial derivatives of the surface
-    #
+        # construct 2-D integrand
+        data = W(self.coordinates(step)).reshape((step, step))
+
+        # do a 1-D integral over every row
+        rows = np.zeros(step)
+        for i in range(step):
+            rows[i] = np.trapz(data[i, :], self.u_linspace(step))
+
+        return np.trapz(rows, self.v_linspace(step))
+
+    def shape_operator(self, uv):
+        """ Compute the Shape Operator
+
+        df * S = dN
+
+        """
+        # The differential of the function
+        df = np.array(self.df(uv))
+
+        # The differential of the Gauss map
+        dN = np.array(self.dN(uv))
+
+        # df•S = dN
+        #
+        # S = df^-1 • dN
+        S = np.einsum("nij,njk->nik", np.linalg.pinv(df), dN)
+
+        return S
+
+    def principal_direction(self, uv):
+        return np.linalg.eig(self.shape_operator(uv))[1]
+
+    def principal_curvature(self, uv):
+        return np.linalg.eig(self.shape_operator(uv))[0]
+
+    def gaussian_curvature(self, uv):
+        return np.linalg.det(self.shape_operator(uv))
+
+    def total_gaussian_curvature(self, step):
+        def k(uv):
+            return self.gaussian_curvature(uv) * self.area_element()(uv)
+
+        return self.discrete_double_integral(k, step)
 
     def normals(self, uv):
         """ Compute unnormalized surface normals
@@ -334,23 +375,31 @@ class MongePatch(Surface):
 
 
 class Sphere(Surface):
+    def __init__(self, r=1):
+        self.r = r
+        super().__init__()
+
     def _X(self, uv):
-        return jnp.cos(uv[0]) * jnp.sin(uv[1])
+        return self.r * jnp.cos(uv[0]) * jnp.sin(uv[1])
 
     def _Y(self, uv):
-        return jnp.sin(uv[0]) * jnp.sin(uv[1])
+        return self.r * jnp.sin(uv[0]) * jnp.sin(uv[1])
 
     def _Z(self, uv):
-        return jnp.cos(uv[1])
+        return self.r * jnp.cos(uv[1])
 
     def u_range(self):
-        return [0.0, 2 * math.pi]
+        return [0.001, 2 * math.pi]
 
     def v_range(self):
-        return [0.0, math.pi]
+        return [0.0001, math.pi]
 
 
-class Ellipsoid(Surface):
+class EllipsoidSpecial(Surface):
+    """https://en.wikipedia.org/wiki/Geodesics_on_an_ellipsoid#Triaxial_coordinate_systems
+       https://math.stackexchange.com/questions/205915/parametrization-for-the-ellipsoids
+    """
+
     def __init__(self, a=3, b=2.2, c=1.9):
         self.a = a
         self.b = b
@@ -376,10 +425,36 @@ class Ellipsoid(Surface):
         return c * jnp.sin(B) * (jnp.sqrt(top) / jnp.sqrt(a ** 2 - c ** 2))
 
     def u_range(self):
-        return [-math.pi, math.pi]
+        return [0.001, math.pi]
 
     def v_range(self):
         return [-math.pi, math.pi]
+
+
+class Ellipsoid(Surface):
+    def __init__(self, a=3, b=2.2, c=1.9):
+        self.a = a
+        self.b = b
+        self.c = c
+        super().__init__()
+
+    def _X(self, uv):
+        u, v = uv
+        return self.a * jnp.cos(u) * jnp.sin(v)
+
+    def _Y(self, uv):
+        u, v = uv
+        return self.b * jnp.sin(u) * jnp.sin(v)
+
+    def _Z(self, uv):
+        u, v = uv
+        return self.c * jnp.cos(v)
+
+    def u_range(self):
+        return [0.001, 2 * math.pi]
+
+    def v_range(self):
+        return [0.001, math.pi]
 
 
 class MonkeySaddle(MongePatch):
@@ -392,3 +467,26 @@ class MonkeySaddle(MongePatch):
 
     def v_range(self):
         return [-math.pi, math.pi]
+
+
+class Torus(Surface):
+    def __init__(self, a=8, b=3, c=7):
+        self.a = a
+        self.b = b
+        self.c = c
+        super().__init__()
+
+    def _X(self, uv):
+        return (self.a + (self.b * jnp.cos(uv[1]))) * jnp.cos(uv[0])
+
+    def _Y(self, uv):
+        return (self.a + (self.b * jnp.cos(uv[1]))) * jnp.sin(uv[0])
+
+    def _Z(self, uv):
+        return self.c * jnp.sin(uv[1])
+
+    def u_range(self):
+        return [0, math.pi * 2]
+
+    def v_range(self):
+        return [0, math.pi * 2]
