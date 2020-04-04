@@ -3,10 +3,12 @@ from abc import abstractmethod
 import math
 import numpy as np
 from jax import np as jnp
+from geometry.smooth.curves import PlaneCurve
+from linear_algebra.la_util import normalize_vectors
 
 
 class Surface(object):
-    """ A parametric surface in three dimensions
+    """ A parametric surface in three dimensions.
     """
 
     def __init__(self):
@@ -24,6 +26,30 @@ class Surface(object):
         # Second partial deriviatives
         # hesx, hesy, hesz where each is (N x 2 x 2)
         self.hessianXYZ = vmap(hessian(self._f))  # (N x 2) -> 3 x N x 2 x 2
+
+        # The first derivative of f
+        # (This is equal to self.jacobian_matrix except in shape)
+        self.df = vmap(jacfwd(self._f))
+
+        dX = grad(self._X)  # (N x 2) -> N x 2
+        dY = grad(self._Y)  # (N x 2) -> N x 2
+        dZ = grad(self._Z)  # (N x 2) -> N x 2
+
+        # The Gauss Map, unvectorized
+        def _N(uv):
+            dfdu, dfdv = jnp.array(jacfwd(self._f)(uv)).swapaxes(0, 1)
+            n = jnp.cross(dfdu, dfdv)
+            return n / jnp.linalg.norm(n)
+
+        # The vectorized guass map
+        self.N = vmap(_N)
+
+        # The vectorized differential of the Guass map
+        # This is called the Weingarten map
+        self.dN = vmap(grad(_N))
+
+    # ======================================================
+    # All abstract methods required to implement this surface
 
     @abstractmethod
     def _X(self, uv):
@@ -65,18 +91,9 @@ class Surface(object):
         """
         pass
 
-    def sample_domain(self, step):
-        """ Linearly sample the 2D domain of the surface
-        """
-        u_start, u_end = surface.u_range()
-        v_start, v_end = surface.v_range()
-        ulist = np.linspace(u_start, u_end, step)
-        vlist = np.linspace(v_start, v_end, step)
-        coords = []
-        for u in ulist:
-            for v in vlist:
-                coords.append([u, v])
-        return np.array(coords)
+    # ======================================================
+    # The fundamental parameterizations of the surface, based
+    # on the individual coordinate functions
 
     def _f(self, uv):
         """ The immersion of the surface into space
@@ -111,6 +128,201 @@ class Surface(object):
         nd.array, N x 3
         """
         return np.array([self.X(uv), self.Y(uv), self.Z(uv)]).swapaxes(0, 1)
+
+    # ======================================================
+    # Methods that deal with discretely sampling the
+    # parameters space
+
+    def u_scale(self, step):
+        """ The distance between two u coordinate samples when
+        a given step size is used.
+        """
+        u_start, u_end = self.u_range()
+        return np.abs(np.subtract(u_start, u_end)) / step
+
+    def v_scale(self, step):
+        """ The distance between two v coordinate samples when
+        a given step size is used.
+        """
+        v_start, v_end = self.v_range()
+        return np.abs(np.subtract(v_start, v_end)) / step
+
+    def u_linspace(self, step):
+        u_start, u_end = self.u_range()
+        return np.linspace(u_start, u_end, step)
+
+    def v_linspace(self, step):
+        v_start, v_end = self.v_range()
+        return np.linspace(v_start, v_end, step)
+
+    def coordinates(self, step):
+        """ Sample the surface domain with a given
+        step size and return a list of coordinates
+        """
+        U = self.u_linspace(step)
+        V = self.v_linspace(step)
+        # Some wild way to get every pair of U,V
+        return np.flip(np.stack(np.meshgrid(U, V), -1).reshape(-1, 2), axis=1)
+
+    def discrete_double_integral(self, W, step):
+        """ 
+        W is a scalar field defined on the surface
+            W : (uv) -> S  (vectorized)
+        
+        This function integrates the field over the surface
+        by sampling it on the surface then summing and scaling
+        the result
+        """
+        values = W(self.coordinates(step))
+        return np.nansum(values * self.u_scale(step) * self.v_scale(step))
+
+    # ========================================================
+    # Constructions from the partial derivatives of the surface
+    #
+
+    def normals(self, uv):
+        """ Compute unnormalized surface normals
+        as the cross product of the tangent vectors at each
+        point on the surface.
+        """
+        dfdu, dfdv = self.gradients(uv)
+        return np.cross(dfdu, dfdv)
+
+    def unit_normals(self, uv):
+        return normalize_vectors(self.normals(uv))
+
+    def jacobian_matrix(self, uv):
+        """  https://en.wikipedia.org/wiki/Jacobian_matrix_and_determinant
+
+        In vector calculus, the Jacobian matrix of a vector-valued function in
+        several variables is the matrix of all its first-order partial derivatives. 
+        When this matrix is square, that is, when the function takes the same number 
+        of variables as input as the number of vector components of its output,
+
+        Vectorized
+
+        Returns
+        -------
+        nd.array, N x 3 x 2
+            A list of 3x2 jacobian matrices
+        """
+
+        # Note: this is equal to self.df, but
+        # this construction does a better job of reminding
+        # you what's happening
+
+        dX = np.array(self.dX(uv))  # dXdu, dXdv
+        dY = np.array(self.dY(uv))  # dYdu, dYdv
+        dZ = np.array(self.dZ(uv))  # dZdu, dZdv
+        return np.array([dX, dY, dZ]).swapaxes(0, 1)
+
+    def gradients(self, uv):
+        """ The gradients of f with respect to u and v
+        
+        Each gradient is a vector field on the surface
+
+        Together the u and v gradients span the tangent plane
+        at each point on the surface
+
+        vectorized
+
+        """
+        J = self.jacobian_matrix(uv)
+        dfdu = J[:, :, 0]
+        dfdv = J[:, :, 1]
+        # (N x 3), (N x 3)
+        return dfdu, dfdv
+
+    def first_fundamental_form(self, uv):
+        """
+        https://en.wikipedia.org/wiki/First_fundamental_form#Example
+        The coefficients of the first fundamental form may be
+        found by taking the dot product of the partial derivatives.
+        
+        vectorized
+
+        Returns
+        -------
+        [nd.array, nd.array, nd.array]
+            E,F, and G for each coordinate uv
+        """
+        dfdu, dfdv = self.gradients(uv)
+        E = np.einsum("ij,ij->i", dfdu, dfdu)
+        F = np.einsum("ij,ij->i", dfdu, dfdv)
+        G = np.einsum("ij,ij->i", dfdv, dfdv)
+        return E, F, G
+
+    def line_element(self, curve: PlaneCurve):
+        """ Given a curve on this surface,
+        produce the line element. A function
+        that can be integrated to get arc length.
+
+        A scalar field defined on a curve on the surface
+
+        An integrand that can be integrated to get arc length
+
+        Returns
+        -------
+        f(t: nd.array, N) -> nd.array, N
+        """
+
+        def f(t):
+            uv = curve.f(t)
+            E, F, G = self.first_fundamental_form(uv)
+            dx = curve.dx(t)
+            dy = curve.dy(t)
+            return np.sqrt(E * dx * dx + 2 * F * dx * dy + G * dy * dy)
+
+        return f
+
+    def area_element(self):
+        """ https://en.wikipedia.org/wiki/Volume_element#Area_element_of_a_surface
+
+        A scalar field on the surface.
+
+        An integrand that can be integrated to get surface area
+
+        Returns
+        -------
+        f(t: nd.array, N) -> nd.array, N
+        """
+
+        def f(uv):
+            E, F, G = self.first_fundamental_form(uv)
+            return np.sqrt(E * G - F * F)
+
+        return f
+
+    # ======================================================
+    # Properties of the surface
+    #
+
+    def surface_area(self, step):
+        """
+        Returns
+        -------
+        float
+        """
+        dA = self.area_element()
+        return self.discrete_double_integral(dA, step)
+
+    def arc_length(self, curve: PlaneCurve, step):
+        """ Compute the length of a curve on this
+        surface. The curve is defined in the parameter space
+        and used to produce the line element, which is integrated
+        over the curve.
+
+        Returns
+        -------
+        float
+        """
+        ds = self.line_element(curve)
+        return curve.discrete_integral(ds, step)
+
+
+# ======================================================
+# Specific surfaces
+#
 
 
 class MongePatch(Surface):

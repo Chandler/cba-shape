@@ -1,6 +1,3 @@
-import numpy as np
-
-
 class SymmetricBilinearForm(object):
     def __init__(self, abc):
         # (uv) => (A,B,C)

@@ -43,10 +43,8 @@ def get_verts(ulist, vlist, func):
 
 
 def triangulate_surface(surface, step):
-    u_start, u_end = surface.u_range()
-    v_start, v_end = surface.v_range()
-    ulist = np.linspace(u_start, u_end, step)
-    vlist = np.linspace(v_start, v_end, step)
+    ulist = surface.u_linspace()
+    vlist = surface.v_linspace()
     coords = []
     for u in ulist:
         for v in vlist:
