@@ -1,6 +1,5 @@
-from geometry.smooth.curves import SpaceCurve
+from geometry.smooth.curve import SpaceCurve
 from util import sample_range
-
 
 class PolygonSpaceCurve(object):
     """ A connected series of line segment in 3D space

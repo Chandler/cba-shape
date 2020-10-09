@@ -5,6 +5,7 @@ from jax import np as jnp
 import math
 import scipy
 import numpy as np
+from linear_algebra.la_util import normalize_vectors, normalize_vector
 
 
 class Curve(object):
@@ -32,6 +33,8 @@ class Curve(object):
     def t_linspace(self, step):
         t_start, t_end = self.t_range()
         return np.linspace(t_start, t_end, step)
+
+    coordinates = t_linspace
 
     def discrete_integral(self, W, step):
         """ 
@@ -114,11 +117,16 @@ class SpaceCurve(Curve):
         self.Y = vmap(self._Y)  # (N x 2) -> N
         self.Z = vmap(self._Z)  # (N x 2) -> N
 
-        # The first derivative of f
-        self.df = jacfwd(self._f)
+        # _T,_N,_B are unvectorized functions that yield the unit tangent, normal
+        # and bi-normal vectors of the curve at t.
+        self._T = lambda t: normalize_vector(jnp.array(jacfwd(self._f)(t)))
+        self._N = lambda t: normalize_vector(jnp.array(jacfwd(self._T)(t)))
+        self._B = lambda t: normalize_vector(jnp.cross(self._T(t), self._N(t)))
 
-        # The second derivative of f
-        self.ddf = jacfwd(jacfwd(self._f))
+        # Vectorized TNB
+        self.T = vmap(self._T)
+        self.N = vmap(self._N)
+        self.B = vmap(self._B)
 
     @abstractmethod
     def _X(self, time: float) -> float:
@@ -168,31 +176,11 @@ class SpaceCurve(Curve):
         """
         return np.array([self.X(t), self.Y(t), self.Z(t)]).swapaxes(0, 1)
 
-    def N(ti):
-        """ Unit normal
-        """
-        return vector_normalize(self.df(t))
-
-    def T(ti):
-        """ Unit tangent
-        """
-        return vector_normalize(self.ddf(t))
-
-    def B(self, t):
-        """ Unit bi-normal
-        """
-
-    def frenet_frame(self, t):
-        """ The orthonormal basis vectors of the frenet frame
-        at time, vectorized
-
-        Returns
-        nd.array, N x 3
-        """
-        return jnp.array([self.T(t), self.N(t), self.B(t)]).swapaxes(0, 1)
-
 
 class Equator(PlaneCurve):
+    """ The equator of the unit sphere
+    """
+
     def _x(self, t):
         return t
 
@@ -234,3 +222,71 @@ class Helix(SpaceCurve):
 
     def _Z(self, t):
         return self.R * jnp.sin(t)
+
+
+class Tractrix(PlaneCurve):
+    def __init__(self, a):
+        self.a = a
+
+    def t_range(self):
+        return [0.001, 1.999]
+
+    def _x(self, t):
+        return self.a * jnp.sin(t)
+
+    def _y(self, t):
+        return self.a * (jnp.cos(t) + jnp.log(jnp.tan(t / 2.0)))
+
+
+class TrefoilKnot(SpaceCurve):
+    def t_range(self):
+        return [0.001, math.pi * 2]
+
+    def _X(self, t):
+        return jnp.sin(t) + 2 * jnp.sin(2 * t)
+
+    def _Y(self, t):
+        return jnp.cos(t) - 2 * jnp.cos(2 * t)
+
+    def _Z(self, t):
+        return -1.0 * jnp.sin(3 * t)
+
+class Line2D(PlaneCurve):
+    def __init__(self, r0=[1,1], v=[0,1]):
+        self.r0 = jnp.array(r0)
+        self.v  = jnp.array(v)
+        super().__init__()
+
+    def t_range(self):
+        return [0, 10.0]
+
+    def line(self, t):
+        return self.r0 + t*self.v
+
+    def _x(self, t):
+        return self.line(t)[0]
+
+    def _y(self, t):
+        return self.line(t)[1]
+
+class Line3D(SpaceCurve):
+    def __init__(self, r0=[1,1,1], v=[1,0.5,0]):
+        self.r0 = jnp.array(r0)
+        self.v  = jnp.array(v)
+        super().__init__()
+
+    def t_range(self):
+        return [0, 1.0]
+
+    def line(self, t):
+        return self.r0 + t*self.v
+
+    def _X(self, t):
+        return self.line(t)[0]
+
+    def _Y(self, t):
+        return self.line(t)[1]
+
+    def _Z(self, t):
+        return self.line(t)[2]
+

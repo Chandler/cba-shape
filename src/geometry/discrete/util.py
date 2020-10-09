@@ -50,7 +50,7 @@ def triangulate_surface(surface, step):
         for v in vlist:
             coords.append([u, v])
 
-    vertices = surface.f(np.array(coords))
+    vertices = np.array(surface.f(np.array(coords)))
 
     face_indices = get_faces(ulist, vlist)
 

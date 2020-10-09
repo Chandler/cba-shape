@@ -3,8 +3,9 @@ from abc import abstractmethod
 import math
 import numpy as np
 from jax import np as jnp
-from geometry.smooth.curves import PlaneCurve
+from geometry.smooth.curves import PlaneCurve, SpaceCurve
 from linear_algebra.la_util import normalize_vectors
+from linear_algebra.forms import SymmetricBilinearForm
 import quadpy
 import scipy
 
@@ -163,8 +164,17 @@ class Surface(object):
         """
         U = self.u_linspace(step)
         V = self.v_linspace(step)
-        # Some wild way to get every pair of U,V
-        return np.flip(np.stack(np.meshgrid(U, V), -1).reshape(-1, 2), axis=1)
+        
+        # wild way to get every pair of U,V
+        # Replaced for now because the coordinate order
+        # doesn't match the double loop method order, which we depend on
+        # return np.flip(np.stack(np.meshgrid(U, V), -1).reshape(-1, 2), axis=1)
+
+        coords = []
+        for u in U:
+            for v in V:
+                coords.append([u, v])
+        return np.array(coords)
 
     def discrete_double_integral(self, W, step):
         """ 
@@ -187,50 +197,20 @@ class Surface(object):
 
         return np.trapz(rows, self.v_linspace(step))
 
-    def shape_operator(self, uv):
-        """ Compute the Shape Operator
+    # ========================================
+    # Derivatives (gradients, jacobians, partial derivatives)
+    #
 
-        df * S = dN
-
+    def vector_laplacian(self, uv):
         """
-        # The differential of the function
-        df = np.array(self.df(uv))
-
-        # The differential of the Gauss map
-        dN = np.array(self.dN(uv))
-
-        # df•S = dN
-        #
-        # S = df^-1 • dN
-        S = np.einsum("nij,njk->nik", np.linalg.pinv(df), dN)
-
-        return S
-
-    def principal_direction(self, uv):
-        return np.linalg.eig(self.shape_operator(uv))[1]
-
-    def principal_curvature(self, uv):
-        return np.linalg.eig(self.shape_operator(uv))[0]
-
-    def gaussian_curvature(self, uv):
-        return np.linalg.det(self.shape_operator(uv))
-
-    def total_gaussian_curvature(self, step):
-        def k(uv):
-            return self.gaussian_curvature(uv) * self.area_element()(uv)
-
-        return self.discrete_double_integral(k, step)
-
-    def normals(self, uv):
-        """ Compute unnormalized surface normals
-        as the cross product of the tangent vectors at each
-        point on the surface.
+        https://en.wikipedia.org/wiki/Vector_Laplacian
         """
-        dfdu, dfdv = self.gradients(uv)
-        return np.cross(dfdu, dfdv)
-
-    def unit_normals(self, uv):
-        return normalize_vectors(self.normals(uv))
+        HX,HY,HZ = self.hessianXYZ(uv)
+        return np.array([
+            np.trace(HX,1,2), 
+            np.trace(HY,1,2), 
+            np.trace(HZ,1,2)
+        ]).swapaxes(0,1)
 
     def jacobian_matrix(self, uv):
         """  https://en.wikipedia.org/wiki/Jacobian_matrix_and_determinant
@@ -274,6 +254,35 @@ class Surface(object):
         # (N x 3), (N x 3)
         return dfdu, dfdv
 
+    def second_partial_derivatives(self, uv):
+        # decompose the hessian for each XYZ
+        HX, HY, HZ = self.hessianXYZ(uv)
+        dXuu, dXuv = HX[:, 0, :].T
+        _, dXvv = HX[:, 1, :].T
+
+        dYuu, dYuv = HY[:, 0, :].T
+        _, dYvv = HY[:, 1, :].T
+
+        dZuu, dZuv = HZ[:, 0, :].T
+        _, dZvv = HZ[:, 1, :].T
+
+        # (N x 3)
+        dfuu = np.array([dXuu, dYuu, dZuu]).T
+        dfuv = np.array([dXuv, dYuv, dZuv]).T
+        dfvv = np.array([dXvv, dYvv, dZvv]).T
+        return dfuu, dfuv, dfvv
+
+    def unit_normals(self, uv):
+        """ Compute unnormalized surface normals
+        as the cross product of the tangent vectors at each
+        point on the surface.
+        """
+        dfdu, dfdv = self.gradients(uv)
+        return normalize_vectors(np.cross(dfdu, dfdv))
+
+    # ======================================================
+    # Surface forms
+    #
     def first_fundamental_form(self, uv):
         """
         https://en.wikipedia.org/wiki/First_fundamental_form#Example
@@ -285,13 +294,41 @@ class Surface(object):
         Returns
         -------
         [nd.array, nd.array, nd.array]
-            E,F, and G for each coordinate uv
+            E, F, and G for each coordinate uv
         """
         dfdu, dfdv = self.gradients(uv)
         E = np.einsum("ij,ij->i", dfdu, dfdu)
         F = np.einsum("ij,ij->i", dfdu, dfdv)
         G = np.einsum("ij,ij->i", dfdv, dfdv)
         return E, F, G
+
+    def second_fundamental_form(self, uv):
+        """ https://en.wikipedia.org/wiki/Second_fundamental_form
+        The coefficents of the second fundamental form
+
+        vectorized
+        """
+        dfuu, dfuv, dfvv = self.second_partial_derivatives(uv)
+
+        n = self.unit_normals(uv)
+
+        L = np.einsum("ij,ij->i", dfuu, n)
+        M = np.einsum("ij,ij->i", dfuv, n)
+        N = np.einsum("ij,ij->i", dfvv, n)
+
+        return L, M, N
+
+    @property
+    def I(self):
+        """ The first fundamental form as a class
+        """
+        return SymmetricBilinearForm(self.first_fundamental_form)
+
+    @property
+    def II(self):
+        """ The second fundamental form as a class
+        """
+        return SymmetricBilinearForm(self.second_fundamental_form)
 
     def line_element(self, curve: PlaneCurve):
         """ Given a curve on this surface,
@@ -335,9 +372,70 @@ class Surface(object):
         return f
 
     # ======================================================
-    # Properties of the surface
+    # Curvature
     #
+    def shape_operator(self, uv):
+        """ Compute the Shape Operator
+        """
+        # The differential of the function
+        df = np.array(self.df(uv))
 
+        # The differential of the Gauss map
+        dN = np.array(self.dN(uv))
+
+        # df•S = dN
+        #
+        # S = df^-1 • dN
+        S = np.einsum("nij,njk->nik", np.linalg.pinv(df), dN)
+
+        return S
+
+    
+    def principal_direction(self, uv):
+        pd = np.real(np.linalg.eig(self.shape_operator(uv))[1])
+        return pd[:,0, :], pd[:,1, :]
+
+    def principal_curvature(self, uv):
+        pc = np.real(np.linalg.eig(self.shape_operator(uv))[0])
+        return pc[:, 0], pc[:, 1]
+
+    def gaussian_curvature(self, uv):
+        """ K as the determinant of the shape operator
+        """
+        return np.linalg.det(self.shape_operator(uv))
+
+    def gaussian_curvature2(self, uv):
+        """ K as the product of the principal
+        curvatures
+        """
+        k1, k2 = self.principal_curvature(uv)
+        return k1 * k2
+
+    def gaussian_curvature3(self, uv):
+        """ K as the ratio of the determinants
+        of the first and second fundamental forms
+        """
+        II = self.II.matrix(uv)
+        I = self.I.matrix(uv)
+        return np.nan_to_num(np.linalg.det(II) / np.linalg.det(I))
+
+    def mean_curvature(self, uv):
+        k1, k2 = self.principal_curvature(uv)
+        return k1 + k2
+
+
+    def total_gaussian_curvature(self, step):
+        """ Total gaussian curvature is a topological property
+        of the surface.
+        """
+        def k(uv):
+            return self.gaussian_curvature(uv) * self.area_element()(uv)
+
+        return self.discrete_double_integral(k, step)
+
+    # ======================================================
+    # Global properties of the surface
+    #
     def surface_area(self, step):
         """
         Returns
@@ -361,10 +459,26 @@ class Surface(object):
         return curve.discrete_integral(ds, step)
 
 
-# ======================================================
-# Specific surfaces
-#
+    # ======================================================
+    # Misc
+    #
+    def shape_index(self, uv):
+        """ A scalar field on the surface, [-1, 1]
+        indicates local shape on a scale from cup -> saddle -> cap
+        https://www.sciencedirect.com/science/article/abs/pii/026288569290076F
+        """
+        k1, k2 = np.array(surface.principal_curvature(uv))
+        S = -2/np.pi * np.arctan((k1+k2)/(k1-k2))
+        return S
 
+    def curvedness(self, uv):
+        """ A scalar field on the surface [0,1]
+        indicates how curved the surface is at the point
+        on a scale from plane -> sphere -> cone tip (singular)
+        """
+        k1, k2 = np.array(surface.principal_curvature(uv))
+        R = np.sqrt((k2**2 + k1**2)/2.0)
+        return R
 
 class MongePatch(Surface):
     def _X(self, uv):
@@ -372,6 +486,119 @@ class MongePatch(Surface):
 
     def _Y(self, uv):
         return uv[1]
+    
+# ======================================================
+# Surface constructors
+#
+class GeneralizedHelicoid(Surface):
+    """ Produce a helicoid surface from a plane curve
+    rotated through space.
+    """
+
+    def __init__(self, curve: PlaneCurve, slant: float):
+        self.curve = curve
+        self.slant = slant
+        super().__init__()
+
+    def u_range(self):
+        return [0, math.pi * 4]
+
+    def v_range(self):
+        return self.curve.t_range()
+
+    def _X(self, uv):
+        u, v = uv
+        return self.curve._x(v) * jnp.cos(u)
+
+    def _Y(self, uv):
+        u, v = uv
+        return self.curve._y(v) * jnp.sin(u)
+
+    def _Z(self, uv):
+        u, v = uv
+        return self.slant * u + self.curve._y(v)
+
+class SurfaceOfRevolution(Surface):
+    def __init__(self, curve: PlaneCurve):
+        self.curve = curve
+        super().__init__()
+
+    def u_range(self):
+        return [0, math.pi * 2]
+
+    def v_range(self):
+        return self.curve.t_range()
+
+    def _X(self, uv):
+        u, v = uv
+        return self.curve._x(v) * jnp.cos(u)
+
+    def _Y(self, uv):
+        u, v = uv
+        return self.curve._x(v) * jnp.sin(u)
+
+    def _Z(self, uv):
+        u, v = uv
+        return self.curve._y(v)
+
+class SpaceCurveTube(Surface):
+    """ Construct a parametric surface from a space
+    curve by creating a tube around the curve
+    """
+
+    def __init__(self, curve: SpaceCurve, radius: float):
+        self.curve = curve
+        self.radius = radius
+        super().__init__()
+
+    def _XYZ(self, uv):
+        # https://math.stackexchange.com/questions/461547/whats-the-equation-of-helix-surface
+        theta, t = uv
+
+        f = self.curve._f
+        N = self.curve._N
+        B = self.curve._B
+        r = self.radius
+
+        XYZ = jnp.array(f(t)) + r * N(t) * jnp.cos(theta) + r * B(t) * jnp.sin(theta)
+
+        return XYZ
+
+    def u_range(self):
+        return [0, math.pi * 2]
+
+    def v_range(self):
+        return self.curve.t_range()
+
+    def _X(self, uv):
+        return self._XYZ(uv)[0]
+
+    def _Y(self, uv):
+        return self._XYZ(uv)[1]
+
+    def _Z(self, uv):
+        return self._XYZ(uv)[2]
+
+class PolarCoordinates(object):
+    """ A mixin for surfaces parameterized
+    in a circular domain
+    """
+    def polar2cart(self, rt):
+        r, theta = rt
+        return [r*jnp.cos(theta), r*jnp.sin(theta)]
+
+    def _X(self, rt):
+        return self.cX(self.polar2cart(rt))
+
+    def _Y(self, rt):
+        return self.cY(self.polar2cart(rt))
+
+    def _Z(self, rt):
+        return self.cZ(self.polar2cart(rt))
+
+# ======================================================
+# Specific surfaces
+#
 
 
 class Sphere(Surface):
@@ -395,7 +622,7 @@ class Sphere(Surface):
         return [0.0001, math.pi]
 
 
-class EllipsoidSpecial(Surface):
+class EllipsoidTriaxial(Surface):
     """https://en.wikipedia.org/wiki/Geodesics_on_an_ellipsoid#Triaxial_coordinate_systems
        https://math.stackexchange.com/questions/205915/parametrization-for-the-ellipsoids
     """
@@ -428,10 +655,10 @@ class EllipsoidSpecial(Surface):
         return [0.001, math.pi]
 
     def v_range(self):
-        return [-math.pi, math.pi]
+        return [0, 2*math.pi]
 
 
-class Ellipsoid(Surface):
+class EllipsoidLatLon(Surface):
     def __init__(self, a=3, b=2.2, c=1.9):
         self.a = a
         self.b = b
@@ -456,20 +683,28 @@ class Ellipsoid(Surface):
     def v_range(self):
         return [0.001, math.pi]
 
+class Torus(Surface):
+    def __init__(self, R=2, r=1):
+        self.R = R
+        self.r = r
+        super().__init__()
 
-class MonkeySaddle(MongePatch):
+    def _X(self, uv):
+        return (self.R + self.r*jnp.cos(uv[1])) * jnp.cos(uv[0])
+
+    def _Y(self, uv):
+        return (self.R + self.r*jnp.cos(uv[1])) * jnp.sin(uv[0])
+
     def _Z(self, uv):
-        u, v = uv
-        return (u ** 3 - 3 * u * (v ** 2)) / 10
+        return self.r * jnp.sin(uv[1])
 
     def u_range(self):
-        return [-math.pi, math.pi]
+        return [0, math.pi * 2]
 
     def v_range(self):
-        return [-math.pi, math.pi]
+        return [0, math.pi * 2]
 
-
-class Torus(Surface):
+class EllipticalTorus(Surface):
     def __init__(self, a=8, b=3, c=7):
         self.a = a
         self.b = b
@@ -490,3 +725,68 @@ class Torus(Surface):
 
     def v_range(self):
         return [0, math.pi * 2]
+
+
+class MonkeySaddle(MongePatch):
+    def _Z(self, uv):
+        u, v = uv
+        return (u ** 3 - 3 * u * (v ** 2)) / 10
+
+    def u_range(self):
+        return [-math.pi, math.pi]
+
+    def v_range(self):
+        return [-math.pi, math.pi]
+
+class Hemisphere(PolarCoordinates, Surface):
+    def __init__(self, sign=1):
+        self.sign=sign
+        super().__init__()
+
+    def cZ(self, uv):
+        u,v = uv
+        return self.sign * jnp.sqrt(1.0-u**2-v**2)
+    
+    def cX(self, uv):
+        return uv[0]
+
+    def cY(self, uv):
+        return uv[1]
+    
+    def u_range(self):
+        return [0.00001, 0.99999]   
+
+    def v_range(self):
+        return [0, 2*math.pi] 
+
+class Catenoid(Surface):
+    def _X(self, uv):
+        return jnp.cosh(uv[1]) * jnp.cos(uv[0])
+
+    def _Y(self, uv):
+        return jnp.cosh(uv[1]) * jnp.sin(uv[0])
+
+    def _Z(self, uv):
+        return uv[1]
+
+    def u_range(self):
+        return [0, 2*math.pi]
+
+    def v_range(self):
+        return [-1, 1]
+
+class Plane(Surface):
+    def _X(self, uv):
+        return uv[0]
+
+    def _Y(self, uv):
+        return uv[1]
+
+    def _Z(self, uv):
+        return 0.0
+
+    def u_range(self):
+        return [-1, 1]
+
+    def v_range(self):
+        return [-1, 1]

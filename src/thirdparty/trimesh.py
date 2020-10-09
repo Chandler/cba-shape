@@ -1,3 +1,4 @@
+# type: ignore
 # https://github.com/yig/trimesh/blob/master/trimesh.py
 from __future__ import print_function, division
 from numpy import *
@@ -12,9 +13,9 @@ def mag(vec):
 
 
 class TriMesh(object):
-    def __init__(self):
-        self.vs = []
-        self.faces = []
+    def __init__(self, vs=[], faces=[]):
+        self.vs = vs
+        self.faces = faces
 
         self.__face_normals = None
         self.__face_areas = None
